@@ -18,69 +18,30 @@ node("cirhos_rhel7") {
         try {
             currentBuild.displayName = "${currentBuild.displayName} ${clusterName}"
             
-            stage("Prepare the repo to store created cluster information") {
-                dir("rhmi-jenkins") {
-                    git branch: "master", url: "https://gitlab.cee.redhat.com/integreatly-qe/rhmi-jenkins.git"
-                    def dirExists = fileExists(clusterInfoDirectory)
-                    if (dirExists) {
-                        error "[ERROR] Configuration files found for ${clusterName}! Make sure that the cluster name is unique"
-                    } 
-                    sh "mkdir -p ${clusterInfoDirectory}"
+            stage("Fetch the integreatly-operator repo") {
+                dir("integreatly-operator") {
+                    git branch: "master", url: "https://gitlab.cee.redhat.com/integreatly-qe/integreatly-operator.git"
                 }
             } // stage
             
-            stage("Update the cluster creation template information") {
-                dir("rhmi-jenkins") {
-                    sh(
-                        returnStdout: false,
-                        script: """
-                            cp templates/cluster.json ${clusterInfoDirectory}
-                            sed -i 's/CLUSTER_NAME/${clusterName}/g' ${clusterInfoDirectory}/cluster.json
-                            echo 'Creating OpenShift 4 OSD cluster with the following configuration:'
-                            cat ${clusterInfoDirectory}/cluster.json
-                        """
-                    )
+            stage("Create the cluster creation config") {
+                dir("integreatly-operator") {
+                    sh "make ocm/cluster.json OCM_CLUSTER_NAME=rhmi-$(date +\"%m%d_%H%M\")"
                 }
             } // stage
 
-            stage("login to ocm") {
+            stage("Login to ocm") {
                 withCredentials([string(credentialsId: "${OCM_TOKEN}", variable: "OCM_ACCESS_TOKEN")]) {
-                    sh "ocm login --url=https://api.stage.openshift.com/ --token=${OCM_ACCESS_TOKEN}"
-                }
-            } // stage
-
-            stage("Push the cluster template to GitLab") {
-                withCredentials([string(credentialsId: "gitlab-access-token", variable: "GITLAB_ACCESS_TOKEN")]) {
-                    dir("rhmi-jenkins") {
-                        sh(
-                            returnStdout: false,
-                            script: """
-                                git remote add jenkins https://oauth2:${GITLAB_ACCESS_TOKEN}@gitlab.cee.redhat.com/integreatly-qe/rhmi-jenkins.git | true
-                                git config --global user.email "integreatly-qe@redhat.com" | true
-                                git config --global user.name "rhmi-jenkins-bot" | true
-                                git add -A
-                                git commit -m 'cluster template created: ${clusterName}'
-                                git push jenkins master
-                            """
-                        )
-                    }
+                    sh "make ocm/login OCM_URL=https://api.stage.openshift.com/ OCM_TOKEN=${OCM_ACCESS_TOKEN}"
                 }
             } // stage
             
             stage("Begin cluster creation") {
-                rootWorkspaceDir = sh (
-                    script: "pwd",
-                    returnStdout: true
-                ).trim()
-                installConfigDirectory = rootWorkspaceDir + "/rhmi-jenkins/" + clusterInfoDirectory + "/"
-                sh "ocm post ${apiPrefix} --body=${installConfigDirectory}cluster.json > ${clusterInfoFileName}"
-                clusterID = sh (
-                    script: "cat ${clusterInfoFileName} | jq -r .id",
-                    returnStdout: true
-                ).trim()
+                sh "make ocm/create/cluster"
+                clusterId = ${OCM_CLUSTER_ID}
             } // stage
 
-            stage("Check if the cluster is ready") {
+            stage("Check if cluster is ready") {
                 Boolean isReady = isClusterReady(clusterID, apiPrefix)
                 while (!isReady) {
                     println "Cluster is not ready yet"
@@ -89,32 +50,18 @@ node("cirhos_rhel7") {
                 }
             } // stage
 
-            stage("Obtain and persist cluster's credentials") {
+            stage("Get cluster credentials") {
                 Boolean areCredentialsAvailable = credentialsAvailable(clusterID, apiPrefix)
                 while (!areCredentialsAvailable) {
                     println "Cluster credentials not available yet"
                     sleep time: 3, unit: 'MINUTES'
                     areCredentialsAvailable = credentialsAvailable(clusterID, apiPrefix)
                 }
-                sh "ocm get ${apiPrefix}/${clusterID}/credentials > ${installConfigDirectory}${clusterCredentialsFileName}"
-                sh "ocm get ${apiPrefix}/${clusterID} > ${installConfigDirectory}${clusterInfoFileName}"
-                withCredentials([string(credentialsId: "gitlab-access-token", variable: "GITLAB_ACCESS_TOKEN")]) {
-                    dir("rhmi-jenkins") {
-                        sh(
-                            returnStdout: false,
-                            script: """
-                                git pull jenkins master
-                                git add -A
-                                git commit -m 'cluster created: ${clusterName}'
-                                git push jenkins master
-                            """
-                        )
-                    }
-                }
+                sh "make ocm/cluster/credentials CLUSTER_ID=${OCM_CLUSTER_ID}"
             } // stage
 
             stage("Logout from ocm") {
-                sh "ocm logout"
+                sh "make ocm/logout"
             } // stage
             
         } catch (caughtError){
